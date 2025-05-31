@@ -1,12 +1,14 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { getAuth, onAuthStateChanged } from 'firebase/auth';
 import { getDatabase, ref, push, update, get } from 'firebase/database';
-import { getStorage, ref as storageRef, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { getStorage, ref as storageRef, uploadBytes, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
 import { firebaseApp } from '@/lib/firebase';
 import { toast } from 'sonner';
-import { X, Upload, Plus, ArrowLeft, Video } from 'lucide-react';
+import { X, Upload, Plus, ArrowLeft, Video, Image, AlertCircle, CheckCircle2 } from 'lucide-react';
 import imageCompression from 'browser-image-compression';
+import { useDropzone } from 'react-dropzone'; // Or whatever is being imported
+
 
 interface ProductFormData {
   name: string;
@@ -17,7 +19,6 @@ interface ProductFormData {
   category: string;
   featured: boolean;
   stock?: number;
-  showStock?: boolean; // Add this field
   images?: string[];
   videoUrl?: string;
   videoFile?: File | null;
@@ -31,11 +32,6 @@ const AdminProductForm = () => {
   const [loading, setLoading] = useState(false);
   const [uploadingImages, setUploadingImages] = useState(false);
   const [uploadingVideo, setUploadingVideo] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState<{
-    current: number;
-    total: number;
-    percentage: number;
-  }>({ current: 0, total: 0, percentage: 0 });
   const [formData, setFormData] = useState<ProductFormData>({
     name: '',
     description: '',
@@ -43,7 +39,6 @@ const AdminProductForm = () => {
     category: '',
     featured: false,
     stock: undefined,
-    showStock: true, // Add this field
     images: [],
     videoUrl: '',
     videoFile: null,
@@ -52,6 +47,29 @@ const AdminProductForm = () => {
   
   // For direct image URL input
   const [imageUrl, setImageUrl] = useState('');
+  const [showCategoryInput, setShowCategoryInput] = useState(false);
+  const [newCategory, setNewCategory] = useState('');
+  
+  // Track upload status for each file
+  const [fileUploads, setFileUploads] = useState<{
+    [key: string]: {
+      file: File;
+      progress: number;
+      status: 'pending' | 'uploading' | 'success' | 'error';
+      url?: string;
+      error?: string;
+    }
+  }>({});
+  
+  // Track if all uploads are complete
+  const [allUploadsComplete, setAllUploadsComplete] = useState(true);
+  
+  // Track upload progress
+  const [uploadProgress, setUploadProgress] = useState<{
+    current: number;
+    total: number;
+    percentage: number;
+  }>({ current: 0, total: 0, percentage: 0 });
   
   const [imageFiles, setImageFiles] = useState<File[]>([]);
   const [categories, setCategories] = useState<string[]>([]);
@@ -59,11 +77,32 @@ const AdminProductForm = () => {
   const [formErrors, setFormErrors] = useState<{[key: string]: string}>({});
   const [touched, setTouched] = useState<{[key: string]: boolean}>({});
   
-  // Helper function to compress images - simplified since we removed the library
-  const compressImage = useCallback(async (file: File, options: any): Promise<File> => {
-    // Just return the original file since we don't have the compression library
-    console.log("Image compression skipped, using original file", options);
-    return file;
+  // Helper function to compress images using browser-image-compression
+  const optimizeImage = useCallback(async (file: File): Promise<File> => {
+    // If file is smaller than 500KB, don't optimize
+    if (file.size < 500 * 1024) {
+      console.log(`File ${file.name} is already small (${file.size} bytes), skipping optimization`);
+      return file;
+    }
+    
+    try {
+      const options = {
+        maxSizeMB: 1, // Max file size in MB
+        maxWidthOrHeight: 1200, // Max width/height in pixels
+        useWebWorker: true, // Use web worker for better performance
+        fileType: 'image/jpeg', // Output format
+        initialQuality: 0.8, // Initial quality (0-1)
+      };
+      
+      console.log(`Optimizing image: ${file.name} (${file.size} bytes)`);
+      const compressedFile = await imageCompression(file, options);
+      console.log(`Optimized image: ${file.size} bytes -> ${compressedFile.size} bytes`);
+      
+      return compressedFile;
+    } catch (error) {
+      console.error('Error optimizing image:', error);
+      return file; // Return original file if optimization fails
+    }
   }, []);
 
   useEffect(() => {
@@ -105,7 +144,7 @@ const AdminProductForm = () => {
     // Add URL to images array
     setFormData(prev => ({
       ...prev,
-      images: [...prev.images, imageUrl]
+      images: [...(prev.images || []), imageUrl]
     }));
     
     // Clear input
@@ -185,11 +224,6 @@ const AdminProductForm = () => {
         // Ensure specifications is always an object
         if (!productData.specifications) {
           productData.specifications = {};
-        }
-        
-        // Ensure showStock has a default value if not present
-        if (productData.showStock === undefined) {
-          productData.showStock = true;
         }
         
         setFormData(productData);
@@ -301,18 +335,179 @@ const AdminProductForm = () => {
     }
   };
   
+  // Setup react-dropzone for image uploads
+  const {
+    getRootProps: getImageRootProps,
+    getInputProps: getImageInputProps,
+    isDragActive: isImageDragActive
+  } = useDropzone({
+    accept: {
+      'image/*': ['.jpeg', '.jpg', '.png', '.gif', '.webp']
+    },
+    maxFiles: 6,
+    onDrop: (acceptedFiles) => {
+      // Limit to 6 images total
+      const totalImages = Object.keys(fileUploads).length + (formData.images ? formData.images.length : 0);
+      if (totalImages + acceptedFiles.length > 6) {
+        toast.error('يمكنك إضافة 6 صور كحد أقصى');
+        return;
+      }
+      
+      // Create a unique ID for each file
+      const newFileUploads = { ...fileUploads };
+      
+      acceptedFiles.forEach(file => {
+        const fileId = `image-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+        newFileUploads[fileId] = {
+          file,
+          progress: 0,
+          status: 'pending'
+        };
+      });
+      
+      setFileUploads(newFileUploads);
+      setAllUploadsComplete(false);
+      
+      // Start uploading immediately
+      Object.entries(newFileUploads)
+        .filter(([_, data]) => data.status === 'pending')
+        .forEach(([fileId, data]) => {
+          uploadSingleFile(fileId, data.file);
+        });
+    }
+  });
+  
+  // Upload a single file with progress tracking
+  const uploadSingleFile = async (fileId: string, file: File) => {
+    try {
+      // Update status to uploading
+      setFileUploads(prev => ({
+        ...prev,
+        [fileId]: {
+          ...prev[fileId],
+          status: 'uploading'
+        }
+      }));
+      
+      // Optimize image
+      const optimizedFile = await optimizeImage(file);
+      
+      // Upload to Firebase Storage
+      const storage = getStorage(firebaseApp);
+      const fileRef = storageRef(storage, `products/${Date.now()}_${optimizedFile.name}`);
+      
+      // Create upload task with progress monitoring
+      const uploadTask = uploadBytesResumable(fileRef, optimizedFile);
+      
+      uploadTask.on('state_changed',
+        (snapshot) => {
+          // Track progress
+          const progress = Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 100);
+          setFileUploads(prev => ({
+            ...prev,
+            [fileId]: {
+              ...prev[fileId],
+              progress
+            }
+          }));
+        },
+        (error) => {
+          // Handle error
+          console.error('Error uploading file:', error);
+          setFileUploads(prev => ({
+            ...prev,
+            [fileId]: {
+              ...prev[fileId],
+              status: 'error',
+              error: error.message
+            }
+          }));
+          
+          // Check if all uploads are complete
+          checkAllUploadsComplete();
+        },
+        async () => {
+          // Upload completed successfully
+          const downloadURL = await getDownloadURL(uploadTask.snapshot.ref);
+          
+          setFileUploads(prev => ({
+            ...prev,
+            [fileId]: {
+              ...prev[fileId],
+              status: 'success',
+              progress: 100,
+              url: downloadURL
+            }
+          }));
+          
+          // Add URL to form data
+          setFormData(prev => ({
+            ...prev,
+            images: [...(prev.images || []), downloadURL]
+          }));
+          
+          // Check if all uploads are complete
+          checkAllUploadsComplete();
+        }
+      );
+    } catch (error) {
+      console.error('Error in upload process:', error);
+      setFileUploads(prev => ({
+        ...prev,
+        [fileId]: {
+          ...prev[fileId],
+          status: 'error',
+          error: error instanceof Error ? error.message : 'Unknown error'
+        }
+      }));
+      
+      // Check if all uploads are complete
+      checkAllUploadsComplete();
+    }
+  };
+  
+  // Check if all uploads are complete
+  const checkAllUploadsComplete = () => {
+    const allComplete = Object.values(fileUploads).every(
+      upload => upload.status === 'success' || upload.status === 'error'
+    );
+    
+    setAllUploadsComplete(allComplete);
+  };
+  
+  // Legacy image change handler for backward compatibility
   const handleImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
       const files = Array.from(e.target.files);
       
       // Limit to 6 images total
-      const totalImages = imageFiles.length + formData.images.length;
+      const totalImages = Object.keys(fileUploads).length + (formData.images ? formData.images.length : 0);
       if (totalImages + files.length > 6) {
         toast.error('يمكنك تحميل 6 صور كحد أقصى');
         return;
       }
       
-      setImageFiles(prev => [...prev, ...files]);
+      // Create a unique ID for each file and add to fileUploads
+      const newFileUploads = { ...fileUploads };
+      
+      files.forEach(file => {
+        const fileId = `image-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+        newFileUploads[fileId] = {
+          file,
+          progress: 0,
+          status: 'pending'
+        };
+      });
+      
+      setFileUploads(newFileUploads);
+      setAllUploadsComplete(false);
+      
+      // Start uploading immediately
+      Object.entries(newFileUploads)
+        .filter(([_, data]) => data.status === 'pending')
+        .forEach(([fileId, data]) => {
+          uploadSingleFile(fileId, data.file);
+        });
     }
   };
   
@@ -356,64 +551,50 @@ const AdminProductForm = () => {
   const removeExistingImage = (index: number) => {
     setFormData(prev => ({
       ...prev,
-      images: prev.images.filter((_, i) => i !== index)
+      images: prev.images && prev.images.length > 0
+        ? prev.images.filter((_, i) => i !== index)
+        : []
     }));
   };
   
-  // Optimize image before upload using browser-image-compression
-  const optimizeImage = useCallback(async (file: File): Promise<File> => {
-    // If file is smaller than 500KB, don't optimize
-    if (file.size < 500 * 1024) {
-      console.log(`File ${file.name} is already small (${file.size} bytes), skipping optimization`);
-      return file;
-    }
+  // Handle adding a new category
+  const handleAddCategory = () => {
+    if (!newCategory.trim()) return;
     
-    try {
-      const options = {
-        maxSizeMB: 1, // Max file size in MB
-        maxWidthOrHeight: 1200, // Max width/height in pixels
-        useWebWorker: true, // Use web worker for better performance
-        fileType: 'image/jpeg', // Output format
-        initialQuality: 0.8, // Initial quality (0-1)
-      };
-      
-      console.log(`Optimizing image: ${file.name} (${file.size} bytes)`);
-      const compressedFile = await imageCompression(file, options);
-      console.log(`Optimized image: ${file.size} bytes -> ${compressedFile.size} bytes`);
-      
-      return compressedFile;
-    } catch (error) {
-      console.error('Error optimizing image:', error);
-      return file; // Return original file if optimization fails
-    }
-  }, []);
-
+    // Add the new category to the list
+    setCategories(prev => [...prev, newCategory.trim()]);
+    
+    // Set the form data category to the new category
+    setFormData(prev => ({
+      ...prev,
+      category: newCategory.trim()
+    }));
+    
+    // Reset the new category input and hide it
+    setNewCategory('');
+    setShowCategoryInput(false);
+  };
+  
   const uploadImages = useCallback(async (): Promise<string[]> => {
     if (imageFiles.length === 0) return [];
     
     setUploadingImages(true);
-    setUploadProgress({ current: 0, total: imageFiles.length, percentage: 0 });
+    const storage = getStorage(firebaseApp);
     
     // Create a toast ID for updating progress
     const toastId = toast.loading(
       <div className="cursor-pointer">
         <div className="font-medium mb-1">جاري تحضير الصور...</div>
-        <div className="text-sm">0 من {imageFiles.length} ({0}%)</div>
+        <div className="text-sm">0 من {imageFiles.length} صور</div>
         <div className="w-full bg-gray-200 rounded-full h-2.5 mt-2">
           <div className="bg-primary h-2.5 rounded-full" style={{ width: '0%' }}></div>
         </div>
       </div>,
-      {
-        duration: 100000, // Long duration
-      }
+      { duration: 100000 } // Long duration
     );
     
-    const storage = getStorage(firebaseApp);
-    
     try {
-      console.log(`Starting upload of ${imageFiles.length} images`);
-      
-      // Optimize images first (in parallel)
+      // Optimize images first
       toast.loading(
         <div className="cursor-pointer">
           <div className="font-medium mb-1">جاري تحسين جودة الصور...</div>
@@ -429,53 +610,46 @@ const AdminProductForm = () => {
       const optimizationPromises = imageFiles.map(file => optimizeImage(file));
       const optimizedFiles = await Promise.all(optimizationPromises);
       
-      toast.loading(
-        <div className="cursor-pointer">
-          <div className="font-medium mb-1">جاري رفع الصور...</div>
-          <div className="text-sm">0 من {imageFiles.length} ({0}%)</div>
-          <div className="w-full bg-gray-200 rounded-full h-2.5 mt-2">
-            <div className="bg-primary h-2.5 rounded-full" style={{ width: '20%' }}></div>
-          </div>
-        </div>,
-        { id: toastId }
-      );
-      
-      // Upload images one by one for better error handling
+      // Upload images one by one for better progress tracking
       const results: string[] = [];
       
       for (let i = 0; i < optimizedFiles.length; i++) {
         try {
           const file = optimizedFiles[i];
-          console.log(`Processing image ${i + 1}: ${file.name}, size: ${file.size} bytes`);
+          
+          // Update progress toast
+          toast.loading(
+            <div className="cursor-pointer">
+              <div className="font-medium mb-1">جاري رفع الصور...</div>
+              <div className="text-sm">{i} من {optimizedFiles.length} صور</div>
+              <div className="w-full bg-gray-200 rounded-full h-2.5 mt-2">
+                <div
+                  className="bg-primary h-2.5 rounded-full"
+                  style={{ width: `${Math.round((i / optimizedFiles.length) * 100)}%` }}
+                ></div>
+              </div>
+            </div>,
+            { id: toastId }
+          );
           
           // Use timestamp and random string to prevent filename collisions
           const uniqueId = `${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
           const safeFileName = file.name.replace(/[^a-zA-Z0-9.]/g, '_');
-          const storagePath = `products/${uniqueId}_${safeFileName}`;
-          
-          console.log(`Uploading to path: ${storagePath}`);
-          const imageRef = storageRef(storage, storagePath);
+          const imageRef = storageRef(storage, `products/${uniqueId}_${safeFileName}`);
           
           // Upload the file
           await uploadBytes(imageRef, file);
-          console.log(`Upload successful, size: ${file.size} bytes`);
           
           // Get the download URL
           const downloadURL = await getDownloadURL(imageRef);
-          console.log(`Got download URL: ${downloadURL}`);
-          
           results.push(downloadURL);
           
-          // Update progress
-          const current = i + 1;
-          const percentage = Math.round(20 + (current / optimizedFiles.length) * 80); // Start at 20%, go to 100%
-          setUploadProgress({ current, total: optimizedFiles.length, percentage });
-          
-          // Update toast with progress
+          // Update progress toast
+          const percentage = Math.round(((i + 1) / optimizedFiles.length) * 100);
           toast.loading(
             <div className="cursor-pointer">
               <div className="font-medium mb-1">جاري رفع الصور...</div>
-              <div className="text-sm">{current} من {optimizedFiles.length} ({percentage}%)</div>
+              <div className="text-sm">{i + 1} من {optimizedFiles.length} صور ({percentage}%)</div>
               <div className="w-full bg-gray-200 rounded-full h-2.5 mt-2">
                 <div
                   className="bg-primary h-2.5 rounded-full"
@@ -487,14 +661,7 @@ const AdminProductForm = () => {
           );
         } catch (error) {
           console.error(`خطأ في رفع الصورة ${i + 1}:`, error);
-          
-          // Update toast with error for this image
-          toast.error(
-            <div>
-              <div className="font-medium mb-1">خطأ في رفع الصورة {i + 1}</div>
-              <div className="text-sm">{(error as Error).message}</div>
-            </div>
-          );
+          toast.error(`حدث خطأ أثناء رفع الصورة ${i + 1}`);
         }
       }
       
@@ -517,31 +684,21 @@ const AdminProductForm = () => {
         );
       }
       
-      console.log(`Upload completed. Successfully uploaded ${results.length} of ${optimizedFiles.length} images`);
       return results;
     } catch (error) {
       console.error('خطأ في معالجة الصور:', error);
-      
-      // Update toast with error
-      toast.error(
-        <div>
-          <div className="font-medium mb-1">خطأ في معالجة الصور</div>
-          <div className="text-sm">{(error as Error).message}</div>
-        </div>,
-        { id: toastId }
-      );
-      
+      toast.error('حدث خطأ أثناء معالجة الصور');
       return [];
     } finally {
       setUploadingImages(false);
-      setUploadProgress({ current: 0, total: 0, percentage: 0 });
     }
-  }, [imageFiles, optimizeImage]);
+  }, [imageFiles]);
   
   const uploadVideo = async (): Promise<string | null> => {
     if (!formData.videoFile) return formData.videoUrl || null;
     
     setUploadingVideo(true);
+    const storage = getStorage(firebaseApp);
     
     // Create a toast ID for updating progress
     const toastId = toast.loading(
@@ -552,81 +709,57 @@ const AdminProductForm = () => {
           <div className="bg-primary h-2.5 rounded-full" style={{ width: '0%' }}></div>
         </div>
       </div>,
-      {
-        duration: 100000, // Long duration
-      }
+      { duration: 100000 } // Long duration
     );
     
-    const storage = getStorage(firebaseApp);
-    
     try {
-      console.log(`Starting video upload: ${formData.videoFile.name}, size: ${formData.videoFile.size} bytes`);
-      
-      // Clean the filename to avoid storage path issues
+      // Create a safe filename
       const safeFileName = formData.videoFile.name.replace(/[^a-zA-Z0-9.]/g, '_');
-      const uniqueId = `${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
-      const storagePath = `products/videos/${uniqueId}_${safeFileName}`;
+      const videoRef = storageRef(storage, `products/videos/${Date.now()}_${safeFileName}`);
       
-      console.log(`Uploading video to path: ${storagePath}`);
-      const videoRef = storageRef(storage, storagePath);
+      // Upload the video
+      const uploadTask = uploadBytesResumable(videoRef, formData.videoFile);
       
-      // Update toast with 50% progress (upload started)
-      toast.loading(
-        <div className="cursor-pointer">
-          <div className="font-medium mb-1">جاري رفع الفيديو...</div>
-          <div className="text-sm">50%</div>
-          <div className="w-full bg-gray-200 rounded-full h-2.5 mt-2">
-            <div className="bg-primary h-2.5 rounded-full" style={{ width: '50%' }}></div>
-          </div>
-        </div>,
-        { id: toastId }
-      );
-      
-      // Upload the file
-      await uploadBytes(videoRef, formData.videoFile);
-      console.log('Video upload successful');
-      
-      // Update toast with 75% progress (getting URL)
-      toast.loading(
-        <div className="cursor-pointer">
-          <div className="font-medium mb-1">جاري معالجة الفيديو...</div>
-          <div className="text-sm">75%</div>
-          <div className="w-full bg-gray-200 rounded-full h-2.5 mt-2">
-            <div className="bg-primary h-2.5 rounded-full" style={{ width: '75%' }}></div>
-          </div>
-        </div>,
-        { id: toastId }
-      );
-      
-      // Get the download URL
-      const videoUrl = await getDownloadURL(videoRef);
-      console.log(`Got video download URL: ${videoUrl}`);
-      
-      // Update toast with success
-      toast.success(
-        <div>
-          <div className="font-medium mb-1">تم رفع الفيديو بنجاح</div>
-          <div className="text-sm">اكتمل الرفع بنجاح</div>
-        </div>,
-        { id: toastId }
-      );
-      
-      return videoUrl;
+      // Monitor upload progress
+      return new Promise((resolve, reject) => {
+        uploadTask.on(
+          'state_changed',
+          (snapshot) => {
+            const progress = Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 100);
+            toast.loading(
+              <div className="cursor-pointer">
+                <div className="font-medium mb-1">جاري رفع الفيديو...</div>
+                <div className="text-sm">{progress}%</div>
+                <div className="w-full bg-gray-200 rounded-full h-2.5 mt-2">
+                  <div
+                    className="bg-primary h-2.5 rounded-full"
+                    style={{ width: `${progress}%` }}
+                  ></div>
+                </div>
+              </div>,
+              { id: toastId }
+            );
+          },
+          (error) => {
+            console.error('خطأ في رفع الفيديو:', error);
+            toast.error('حدث خطأ أثناء رفع الفيديو', { id: toastId });
+            setUploadingVideo(false);
+            reject(null);
+          },
+          async () => {
+            // Upload complete
+            const videoUrl = await getDownloadURL(uploadTask.snapshot.ref);
+            toast.success('تم رفع الفيديو بنجاح', { id: toastId });
+            setUploadingVideo(false);
+            resolve(videoUrl);
+          }
+        );
+      });
     } catch (error) {
       console.error('خطأ في رفع الفيديو:', error);
-      
-      // Update toast with error
-      toast.error(
-        <div>
-          <div className="font-medium mb-1">خطأ في رفع الفيديو</div>
-          <div className="text-sm">{(error as Error).message}</div>
-        </div>,
-        { id: toastId }
-      );
-      
-      return null;
-    } finally {
+      toast.error('حدث خطأ أثناء رفع الفيديو');
       setUploadingVideo(false);
+      return null;
     }
   };
   
@@ -676,8 +809,18 @@ const AdminProductForm = () => {
       return;
     }
     
-    if (formData.images.length === 0 && imageFiles.length === 0) {
+    if ((!formData.images || formData.images.length === 0) && Object.keys(fileUploads).length === 0) {
       toast.error('يجب إضافة صورة واحدة على الأقل', {
+        className: 'form-error-toast',
+        position: 'top-center',
+        duration: 3000,
+      });
+      return;
+    }
+    
+    // Check if uploads are still in progress
+    if (!allUploadsComplete) {
+      toast.error('يرجى الانتظار حتى اكتمال رفع الصور', {
         className: 'form-error-toast',
         position: 'top-center',
         duration: 3000,
@@ -688,24 +831,16 @@ const AdminProductForm = () => {
     setLoading(true);
     
     try {
-      // First save the product data without waiting for image uploads
+      // First, save the product data without waiting for image uploads
       const db = getDatabase(firebaseApp);
       
       // Create a temporary product object with existing images
       const initialProductData = {
-        name: formData.name,
-        description: formData.description,
-        price: formData.price || 0,
-        originalPrice: formData.originalPrice,
-        discount: formData.discount,
-        category: formData.category,
-        featured: formData.featured,
-        stock: formData.stock || 0,
-        showStock: formData.showStock, // Add this field
-        images: formData.images || [],
-        videoUrl: formData.videoUrl || '',
-        specifications: formData.specifications || {},
-        updatedAt: Date.now()
+        ...formData,
+        images: formData.images ? [...formData.images] : [], // Use existing images only initially
+        videoUrl: formData.videoUrl,
+        videoFile: null,
+        uploading: true // Flag to indicate images are still uploading
       };
       
       let productKey: string;
@@ -726,84 +861,54 @@ const AdminProductForm = () => {
         toast.success('تم إضافة المنتج بنجاح', {
           description: 'جاري رفع الصور...'
         });
+        
+        // Don't navigate immediately, wait for image uploads to complete
       }
       
-      // Upload images and video before navigating
+      // Wait for image uploads to complete before navigating
       try {
         // Upload new images
-        let uploadedImageUrls: string[] = [];
-        if (imageFiles.length > 0) {
-          uploadedImageUrls = await uploadImages();
-        }
-        
-        // Upload video if provided
-        let finalVideoUrl = formData.videoUrl;
-        if (formData.videoFile) {
-          finalVideoUrl = await uploadVideo() || finalVideoUrl;
-        }
+        const uploadedImageUrls = await uploadImages();
         
         // Combine existing and new image URLs
         const allImages = [...(formData.images || []), ...uploadedImageUrls];
         
-        // Update the product with the final image URLs
+        // Upload video if provided
+        let finalVideoUrl = formData.videoUrl;
+        if (formData.videoFile) {
+          finalVideoUrl = await uploadVideo();
+        }
+        
+        // Update the product with the image URLs
         const productRef = ref(db, `products/${productKey}`);
         await update(productRef, {
           images: allImages,
-          videoUrl: finalVideoUrl || ''
+          videoUrl: finalVideoUrl,
+          uploading: false // Mark upload as complete
         });
         
-        console.log('Product updated with new images and video');
-        toast.success('تم رفع الصور والفيديو بنجاح');
+        toast.success('تم رفع جميع الصور بنجاح');
         
         // Navigate to dashboard after everything is complete
         navigate('/admin-dashboard');
       } catch (error) {
         console.error('خطأ في رفع الصور:', error);
-        toast.error('حدث خطأ أثناء رفع الصور');
+        toast.error('تم حفظ المنتج ولكن حدث خطأ أثناء رفع بعض الصور');
+        
+        // Update the product to mark upload as complete even if some images failed
+        const productRef = ref(db, `products/${productKey}`);
+        await update(productRef, {
+          uploading: false
+        });
+        
+        // Still navigate to dashboard even if there was an error
+        navigate('/admin-dashboard');
       }
-      
     } catch (error) {
       console.error('خطأ في حفظ المنتج:', error);
       toast.error('حدث خطأ أثناء حفظ المنتج');
+    } finally {
       setLoading(false);
-    }
-  };
-
-  // Add a new category
-  const [newCategory, setNewCategory] = useState('');
-  const [showCategoryInput, setShowCategoryInput] = useState(false);
-
-  const handleAddCategory = async () => {
-    if (!newCategory.trim()) {
-      toast.error('الرجاء إدخال اسم الفئة');
-      return;
-    }
-
-    try {
-      const db = getDatabase(firebaseApp);
-      const categoriesRef = ref(db, 'categories');
-      const newCategoryRef = await push(categoriesRef, {
-        name: newCategory,
-        arabicName: newCategory
-      });
-
-      // Add to local categories list
-      setCategories(prev => [...prev, newCategory]);
-      
-      // Set as current category
-      setFormData(prev => ({
-        ...prev,
-        category: newCategory
-      }));
-
-      // Reset input
-      setNewCategory('');
-      setShowCategoryInput(false);
-      
-      toast.success('تمت إضافة الفئة بنجاح');
-    } catch (error) {
-      console.error('خطأ في إضافة الفئة:', error);
-      toast.error('حدث خطأ أثناء إضافة الفئة');
     }
   };
 
@@ -815,7 +920,7 @@ const AdminProductForm = () => {
           <h1 className="text-xl font-bold">
             {isEditMode ? 'تعديل منتج' : 'إضافة منتج جديد'}
           </h1>
-          <button
+          <button 
             onClick={() => navigate('/admin-dashboard')}
             className="flex items-center gap-2 bg-primary-foreground/10 hover:bg-primary-foreground/20 transition-colors rounded-md px-3 py-1.5"
           >
@@ -845,15 +950,14 @@ const AdminProductForm = () => {
                   onChange={handleInputChange}
                   onBlur={() => handleBlur('name')}
                   className={`w-full px-3 py-2 border ${touched.name && formErrors.name ? 'border-red-500' : 'border-border'} rounded-md focus:outline-none focus:ring-2 focus:ring-primary/50 bg-background text-foreground`}
-                  placeholder="أدخل اسم المنتج"
                   dir="rtl"
                 />
                 {touched.name && formErrors.name && (
                   <p className="mt-1 text-sm text-red-500">{formErrors.name}</p>
                 )}
               </div>
-
-              {/* Product Description */}
+              
+              {/* Description */}
               <div className="md:col-span-2">
                 <label htmlFor="description" className="block text-sm font-medium mb-1">وصف المنتج *</label>
                 <textarea
@@ -862,16 +966,15 @@ const AdminProductForm = () => {
                   value={formData.description}
                   onChange={handleInputChange}
                   onBlur={() => handleBlur('description')}
-                  rows={4}
+                  rows={5}
                   className={`w-full px-3 py-2 border ${touched.description && formErrors.description ? 'border-red-500' : 'border-border'} rounded-md focus:outline-none focus:ring-2 focus:ring-primary/50 bg-background text-foreground`}
-                  placeholder="أدخل وصف المنتج"
                   dir="rtl"
                 />
                 {touched.description && formErrors.description && (
                   <p className="mt-1 text-sm text-red-500">{formErrors.description}</p>
                 )}
               </div>
-
+              
               {/* Price */}
               <div>
                 <label htmlFor="price" className="block text-sm font-medium mb-1">السعر *</label>
@@ -883,15 +986,15 @@ const AdminProductForm = () => {
                   onChange={handleInputChange}
                   onBlur={() => handleBlur('price')}
                   className={`w-full px-3 py-2 border ${touched.price && formErrors.price ? 'border-red-500' : 'border-border'} rounded-md focus:outline-none focus:ring-2 focus:ring-primary/50 bg-background text-foreground`}
-                  placeholder="أدخل السعر"
                   min="0"
                   step="0.01"
+                  dir="rtl"
                 />
                 {touched.price && formErrors.price && (
                   <p className="mt-1 text-sm text-red-500">{formErrors.price}</p>
                 )}
               </div>
-
+              
               {/* Original Price */}
               <div>
                 <label htmlFor="originalPrice" className="block text-sm font-medium mb-1">السعر الأصلي (اختياري)</label>
@@ -902,15 +1005,23 @@ const AdminProductForm = () => {
                   value={formData.originalPrice || ''}
                   onChange={handleInputChange}
                   className="w-full px-3 py-2 border border-border rounded-md focus:outline-none focus:ring-2 focus:ring-primary/50 bg-background text-foreground"
-                  placeholder="أدخل السعر الأصلي"
                   min="0"
                   step="0.01"
+                  dir="rtl"
                 />
-                {formData.discount !== undefined && (
-                  <p className="mt-1 text-sm text-green-600">خصم: {formData.discount}%</p>
-                )}
+                <p className="mt-1 text-xs text-foreground/60">أدخل السعر الأصلي إذا كان المنتج معروضًا بخصم</p>
               </div>
-
+              
+              {/* Discount */}
+              {formData.discount !== undefined && (
+                <div>
+                  <label className="block text-sm font-medium mb-1">نسبة الخصم</label>
+                  <div className="px-3 py-2 border border-border rounded-md bg-secondary/50 text-foreground">
+                    {formData.discount}%
+                  </div>
+                </div>
+              )}
+              
               {/* Stock */}
               <div>
                 <label htmlFor="stock" className="block text-sm font-medium mb-1">المخزون *</label>
@@ -922,14 +1033,14 @@ const AdminProductForm = () => {
                   onChange={handleInputChange}
                   onBlur={() => handleBlur('stock')}
                   className={`w-full px-3 py-2 border ${touched.stock && formErrors.stock ? 'border-red-500' : 'border-border'} rounded-md focus:outline-none focus:ring-2 focus:ring-primary/50 bg-background text-foreground`}
-                  placeholder="أدخل كمية المخزون"
                   min="0"
+                  dir="rtl"
                 />
                 {touched.stock && formErrors.stock && (
                   <p className="mt-1 text-sm text-red-500">{formErrors.stock}</p>
                 )}
               </div>
-
+              
               {/* Featured */}
               <div>
                 <div className="flex items-center">
@@ -943,25 +1054,9 @@ const AdminProductForm = () => {
                   />
                   <label htmlFor="featured" className="ml-2 block text-sm font-medium">منتج مميز</label>
                 </div>
-                <p className="mt-1 text-xs text-foreground/60">المنتجات المميزة تظهر في الصفحة الرئيسية</p>
+                <p className="mt-1 text-xs text-foreground/60">عرض المنتج في قسم المنتجات المميزة في الصفحة الرئيسية</p>
               </div>
-
-              {/* Show Stock */}
-              <div>
-                <div className="flex items-center">
-                  <input
-                    type="checkbox"
-                    id="showStock"
-                    name="showStock"
-                    checked={formData.showStock}
-                    onChange={handleInputChange}
-                    className="w-4 h-4 text-primary border-border rounded focus:ring-primary/50"
-                  />
-                  <label htmlFor="showStock" className="ml-2 block text-sm font-medium">عرض المخزون للعملاء</label>
-                </div>
-                <p className="mt-1 text-xs text-foreground/60">إظهار كمية المخزون المتبقية في صفحة المنتج</p>
-              </div>
-
+              
               {/* Category */}
               <div className="md:col-span-2">
                 <label htmlFor="category" className="block text-sm font-medium mb-1">الفئة *</label>
@@ -985,7 +1080,7 @@ const AdminProductForm = () => {
                     <button
                       type="button"
                       onClick={() => setShowCategoryInput(false)}
-                      className="px-3 py-2 bg-secondary-foreground/10 text-secondary-foreground rounded-md hover:bg-secondary-foreground/20 transition-colors"
+                      className="px-3 py-2 bg-secondary text-secondary-foreground rounded-md hover:bg-secondary/90 transition-colors"
                     >
                       إلغاء
                     </button>
@@ -1011,7 +1106,7 @@ const AdminProductForm = () => {
                       onClick={() => setShowCategoryInput(true)}
                       className="px-3 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90 transition-colors"
                     >
-                      <Plus className="w-5 h-5" />
+                      فئة جديدة
                     </button>
                   </div>
                 )}
@@ -1019,67 +1114,59 @@ const AdminProductForm = () => {
                   <p className="mt-1 text-sm text-red-500">{formErrors.category}</p>
                 )}
               </div>
-
+              
               {/* Specifications */}
               <div className="md:col-span-2">
-                <div className="flex justify-between items-center mb-2">
-                  <label className="block text-sm font-medium">المواصفات (اختياري)</label>
-                  <button
-                    type="button"
-                    onClick={addSpecification}
-                    className="text-sm flex items-center gap-1 text-primary hover:text-primary/80 transition-colors"
-                  >
-                    <Plus className="w-4 h-4" />
-                    إضافة مواصفة
-                  </button>
+                <label className="block text-sm font-medium mb-2">المواصفات (اختياري)</label>
+                <div className="space-y-3 mb-3">
+                  {Object.entries(formData.specifications || {}).map(([key, value]) => (
+                    <div key={key} className="flex gap-2">
+                      <input
+                        type="text"
+                        value={key}
+                        onChange={(e) => handleSpecificationChange(key, e.target.value, value)}
+                        className="flex-1 px-3 py-2 border border-border rounded-md focus:outline-none focus:ring-2 focus:ring-primary/50 bg-background text-foreground"
+                        placeholder="اسم المواصفة"
+                        dir="rtl"
+                      />
+                      <input
+                        type="text"
+                        value={value}
+                        onChange={(e) => handleSpecificationValueChange(key, e.target.value)}
+                        className="flex-1 px-3 py-2 border border-border rounded-md focus:outline-none focus:ring-2 focus:ring-primary/50 bg-background text-foreground"
+                        placeholder="قيمة المواصفة"
+                        dir="rtl"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => removeSpecification(key)}
+                        className="p-2 text-red-500 hover:text-red-700 transition-colors"
+                      >
+                        <X className="w-5 h-5" />
+                      </button>
+                    </div>
+                  ))}
                 </div>
-                
-                {Object.entries(formData.specifications || {}).length === 0 ? (
-                  <p className="text-sm text-foreground/60 italic">لا توجد مواصفات. انقر على "إضافة مواصفة" لإضافة مواصفات للمنتج.</p>
-                ) : (
-                  <div className="space-y-3">
-                    {Object.entries(formData.specifications || {}).map(([key, value], index) => (
-                      <div key={index} className="flex gap-2 items-start">
-                        <input
-                          type="text"
-                          value={key}
-                          onChange={(e) => handleSpecificationChange(key, e.target.value, value)}
-                          className="flex-1 px-3 py-2 border border-border rounded-md focus:outline-none focus:ring-2 focus:ring-primary/50 bg-background text-foreground"
-                          placeholder="اسم المواصفة"
-                          dir="rtl"
-                        />
-                        <input
-                          type="text"
-                          value={value}
-                          onChange={(e) => handleSpecificationValueChange(key, e.target.value)}
-                          className="flex-1 px-3 py-2 border border-border rounded-md focus:outline-none focus:ring-2 focus:ring-primary/50 bg-background text-foreground"
-                          placeholder="قيمة المواصفة"
-                          dir="rtl"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => removeSpecification(key)}
-                          className="p-2 text-red-500 hover:bg-red-50 rounded-md transition-colors"
-                        >
-                          <X className="w-5 h-5" />
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
+                <button
+                  type="button"
+                  onClick={addSpecification}
+                  className="flex items-center gap-1 text-sm text-primary hover:text-primary/80 transition-colors"
+                >
+                  <Plus className="w-4 h-4" />
+                  إضافة مواصفة
+                </button>
               </div>
-
+              
               {/* Images */}
               <div className="md:col-span-2">
                 <label className="block text-sm font-medium mb-2">صور المنتج *</label>
-                <p className="text-sm text-foreground/60 mb-2">يمكنك تحميل حتى 6 صور. الصورة الأولى إلزامية وستكون الصورة الرئيسية.</p>
                 
                 {/* Existing Images */}
-                {formData.images.length > 0 && (
+                {formData.images && formData.images.length > 0 && (
                   <div className="mb-4">
                     <p className="text-sm font-medium mb-2">الصور الحالية:</p>
                     <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
-                      {formData.images.map((image, index) => (
+                      {formData.images && formData.images.map((image, index) => (
                         <div key={index} className="relative group">
                           <img
                             src={image}
@@ -1093,64 +1180,111 @@ const AdminProductForm = () => {
                           >
                             <X className="w-4 h-4" />
                           </button>
-                          {index === 0 && (
-                            <span className="absolute bottom-1 left-1 bg-primary text-primary-foreground text-xs px-2 py-0.5 rounded">
-                              رئيسية
-                            </span>
-                          )}
                         </div>
                       ))}
                     </div>
                   </div>
                 )}
                 
-                {/* Image Upload */}
-                <div className="mb-4">
-                  <p className="text-sm font-medium mb-2">تحميل صور جديدة:</p>
-                  <div className="flex flex-col gap-4">
-                    <label className="flex flex-col items-center justify-center w-full h-32 border-2 border-dashed border-border rounded-md cursor-pointer hover:bg-secondary/50 transition-colors">
-                      <div className="flex flex-col items-center justify-center pt-5 pb-6">
-                        <Upload className="w-8 h-8 text-foreground/60 mb-2" />
-                        <p className="mb-2 text-sm text-foreground/80">
-                          <span className="font-medium">انقر لتحميل الصور</span> أو اسحب وأفلت
-                        </p>
-                        <p className="text-xs text-foreground/60">PNG, JPG, WEBP حتى 10MB</p>
-                      </div>
-                      <input
-                        type="file"
-                        className="hidden"
-                        accept="image/*"
-                        multiple
-                        onChange={handleImageChange}
-                      />
-                    </label>
-                    
-                    {/* Preview of selected files */}
-                    {imageFiles.length > 0 && (
-                      <div>
-                        <p className="text-sm font-medium mb-2">الصور المحددة:</p>
-                        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
-                          {imageFiles.map((file, index) => (
-                            <div key={index} className="relative group">
-                              <img
-                                src={URL.createObjectURL(file)}
-                                alt={`صورة ${index + 1}`}
-                                className="w-full h-24 object-cover rounded-md border border-border"
-                              />
-                              <button
-                                type="button"
-                                onClick={() => removeImage(index)}
-                                className="absolute top-1 right-1 bg-red-500 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity"
-                              >
-                                <X className="w-4 h-4" />
-                              </button>
-                            </div>
-                          ))}
+                {/* New Images */}
+                {imageFiles.length > 0 && (
+                  <div className="mb-4">
+                    <p className="text-sm font-medium mb-2">الصور الجديدة:</p>
+                    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
+                      {imageFiles.map((file, index) => (
+                        <div key={index} className="relative group">
+                          <img
+                            src={URL.createObjectURL(file)}
+                            alt={`صورة ${index + 1}`}
+                            className="w-full h-24 object-cover rounded-md border border-border"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => removeImage(index)}
+                            className="absolute top-1 right-1 bg-red-500 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                          >
+                            <X className="w-4 h-4" />
+                          </button>
                         </div>
-                      </div>
-                    )}
+                      ))}
+                    </div>
+                  </div>
+                )}
+                
+                {/* Image Upload with React Dropzone */}
+                <div className="mb-4">
+                  <div
+                    {...getImageRootProps()}
+                    className={`flex flex-col items-center justify-center w-full h-32 border-2 border-dashed rounded-md cursor-pointer transition-colors ${
+                      isImageDragActive
+                        ? 'border-primary bg-primary/10'
+                        : 'border-border hover:bg-secondary/50'
+                    }`}
+                  >
+                    <div className="flex flex-col items-center justify-center pt-5 pb-6">
+                      <Upload className="w-8 h-8 text-foreground/60 mb-2" />
+                      <p className="mb-2 text-sm text-foreground/80">
+                        <span className="font-medium">انقر لتحميل الصور</span> أو اسحب وأفلت
+                      </p>
+                      <p className="text-xs text-foreground/60">PNG, JPG, WEBP حتى 6 صور</p>
+                    </div>
+                    <input {...getImageInputProps()} />
                   </div>
                 </div>
+                
+                {/* Upload Progress */}
+                {Object.keys(fileUploads).length > 0 && (
+                  <div className="mb-4 space-y-2">
+                    <h3 className="text-sm font-medium mb-2">جاري رفع الصور</h3>
+                    {Object.entries(fileUploads).map(([fileId, data]) => (
+                      <div key={fileId} className="flex items-center space-x-2 rtl:space-x-reverse">
+                        <div className="w-10 h-10 bg-secondary/50 rounded-md flex items-center justify-center overflow-hidden relative">
+                          {data.status === 'success' && data.url ? (
+                            <img src={data.url} alt="Uploaded" className="w-full h-full object-cover" />
+                          ) : (
+                            <Image className="w-6 h-6 text-foreground/60" />
+                          )}
+                          {data.status === 'error' && (
+                            <div className="absolute inset-0 bg-red-500/20 flex items-center justify-center">
+                              <AlertCircle className="w-5 h-5 text-red-500" />
+                            </div>
+                          )}
+                          {data.status === 'success' && (
+                            <div className="absolute inset-0 bg-green-500/20 flex items-center justify-center">
+                              <CheckCircle2 className="w-5 h-5 text-green-500" />
+                            </div>
+                          )}
+                        </div>
+                        <div className="flex-1">
+                          <div className="flex justify-between items-center mb-1">
+                            <span className="text-xs truncate max-w-[200px] text-foreground/80">
+                              {data.file.name}
+                            </span>
+                            <span className="text-xs text-foreground/60">
+                              {data.status === 'success'
+                                ? 'تم الرفع'
+                                : data.status === 'error'
+                                  ? 'فشل الرفع'
+                                  : `${data.progress}%`}
+                            </span>
+                          </div>
+                          <div className="w-full bg-secondary h-1.5 rounded-full overflow-hidden">
+                            <div
+                              className={`h-full rounded-full ${
+                                data.status === 'error'
+                                  ? 'bg-red-500'
+                                  : data.status === 'success'
+                                    ? 'bg-green-500'
+                                    : 'bg-primary'
+                              }`}
+                              style={{ width: `${data.progress}%` }}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
                 
                 {/* Image URL Input */}
                 <div>
@@ -1173,7 +1307,7 @@ const AdminProductForm = () => {
                   </div>
                 </div>
               </div>
-
+              
               {/* Video */}
               <div className="md:col-span-2">
                 <label className="block text-sm font-medium mb-2">فيديو المنتج (اختياري)</label>
@@ -1249,17 +1383,10 @@ const AdminProductForm = () => {
             <div className="flex justify-end">
               <button
                 type="submit"
-                disabled={loading || uploadingImages || uploadingVideo}
-                className="btn-hover bg-primary text-primary-foreground rounded-md py-3 px-6 font-medium hover:bg-primary/90 transition-colors disabled:opacity-70 disabled:cursor-not-allowed"
+                disabled={loading || uploadingImages}
+                className="btn-hover bg-primary text-primary-foreground rounded-md py-3 px-6 font-medium hover:bg-primary/90 transition-colors"
               >
-                {loading || uploadingImages || uploadingVideo ? (
-                  <span className="flex items-center gap-2">
-                    <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin"></div>
-                    {isEditMode ? 'جاري التحديث...' : 'جاري الإضافة...'}
-                  </span>
-                ) : (
-                  isEditMode ? 'تحديث المنتج' : 'إضافة المنتج'
-                )}
+                {isEditMode ? 'تحديث المنتج' : 'إضافة المنتج'}
               </button>
             </div>
           </form>

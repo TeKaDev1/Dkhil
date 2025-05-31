@@ -14,7 +14,7 @@ import ProductDetail from "./pages/ProductDetail";
 import Login from "./pages/Login";
 import NotFound from "./pages/NotFound";
 import AdminDashboard from "./pages/AdminDashboard";
-import AdminProductForm from "./pages/AdminProductForm.new";
+import AdminProductForm from "./pages/AdminProductForm";
 import ClientDashboard from "./pages/ClientDashboard";
 import FacebookAdPage from "./pages/FacebookAdPage";
 
